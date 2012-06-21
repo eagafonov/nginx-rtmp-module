@@ -126,6 +126,10 @@ rtmp {
             # Pull all streams from remote machine
             # and play locally
             pull rtmp3.example.com;
+
+            # set relay params (except for 'app' & 'tcUrl')
+            relay_param pageUrl 'http://example.com/path';
+            relay_param flashVer 'LNX.11,1,102,55';
         }
 
         # Many publishers, many subscribers

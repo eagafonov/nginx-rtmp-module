@@ -18,6 +18,8 @@ static char * ngx_rtmp_relay_merge_app_conf(ngx_conf_t *cf,
         void *parent, void *child);
 static char * ngx_rtmp_relay_push_pull(ngx_conf_t *cf, ngx_command_t *cmd, 
         void *conf);
+static char * ngx_rtmp_relay_param(ngx_conf_t *cf, ngx_command_t *cmd, 
+        void *conf);
 static ngx_int_t ngx_rtmp_relay_publish(ngx_rtmp_session_t *s, 
         ngx_rtmp_publish_t *v);
 
@@ -60,10 +62,18 @@ struct ngx_rtmp_relay_ctx_s {
 
 
 typedef struct {
+    ngx_str_t                       name;
+    ngx_str_t                       value;
+} ngx_rtmp_relay_param_t;
+
+
+typedef struct {
     ngx_array_t                     targets;
     ngx_log_t                      *log;
     ngx_uint_t                      nbuckets;
     ngx_msec_t                      buflen;
+    ngx_array_t                     params;     /* ngx_rtmp_relay_param_t */
+    ngx_array_t                     param_elts; /* ngx_rtmp_amf_elt_t */
     ngx_rtmp_relay_ctx_t          **ctx;
 } ngx_rtmp_relay_app_conf_t;
 
@@ -95,6 +105,13 @@ static ngx_command_t  ngx_rtmp_relay_commands[] = {
     { ngx_string("pull"),
       NGX_RTMP_APP_CONF|NGX_CONF_TAKE1|NGX_CONF_TAKE2|NGX_CONF_TAKE3,
       ngx_rtmp_relay_push_pull,
+      NGX_RTMP_APP_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("relay_param"),
+      NGX_RTMP_APP_CONF|NGX_CONF_TAKE1|NGX_CONF_TAKE2|NGX_CONF_TAKE2,
+      ngx_rtmp_relay_param,
       NGX_RTMP_APP_CONF_OFFSET,
       0,
       NULL },
@@ -141,7 +158,8 @@ ngx_module_t  ngx_rtmp_relay_module = {
 static void *
 ngx_rtmp_relay_create_app_conf(ngx_conf_t *cf)
 {
-    ngx_rtmp_relay_app_conf_t     *racf;
+    ngx_rtmp_relay_app_conf_t      *racf;
+    ngx_rtmp_relay_param_t         *param;
 
     racf = ngx_pcalloc(cf->pool, sizeof(ngx_rtmp_relay_app_conf_t));
     if (racf == NULL) {
@@ -153,6 +171,16 @@ ngx_rtmp_relay_create_app_conf(ngx_conf_t *cf)
     racf->log = &cf->cycle->new_log;
     racf->buflen = NGX_CONF_UNSET;
 
+    ngx_array_init(&racf->params, cf->pool, 2, sizeof(ngx_rtmp_relay_param_t));
+
+    /* make slots for app & tcUrl */
+    param = ngx_array_push_n(&racf->params, 2);
+    ngx_str_set(&param->name, "app");
+    ngx_str_set(&param->value, "");
+    ++param;
+    ngx_str_set(&param->name, "tcUrl");
+    ngx_str_set(&param->value, "");
+
     return racf;
 }
 
@@ -160,13 +188,32 @@ ngx_rtmp_relay_create_app_conf(ngx_conf_t *cf)
 static char *
 ngx_rtmp_relay_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
 {
-    ngx_rtmp_relay_app_conf_t *prev = parent;
-    ngx_rtmp_relay_app_conf_t *conf = child;
+    ngx_rtmp_relay_app_conf_t      *prev = parent;
+    ngx_rtmp_relay_app_conf_t      *conf = child;
+    ngx_rtmp_relay_param_t         *param;
+    ngx_rtmp_amf_elt_t             *param_elt;
+    size_t                          n;
 
     conf->ctx = ngx_pcalloc(cf->pool, sizeof(ngx_rtmp_relay_ctx_t *) 
             * conf->nbuckets);
 
     ngx_conf_merge_msec_value(conf->buflen, prev->buflen, 5000);
+
+    if (conf->params.nelts) {
+        if (ngx_array_init(&conf->param_elts, cf->pool, conf->params.nelts,
+                sizeof(ngx_rtmp_amf_elt_t)) != NGX_OK)
+        {
+            return NGX_CONF_ERROR;
+        }
+        param = conf->params.elts;
+        param_elt = ngx_array_push_n(&conf->param_elts, conf->params.nelts);
+        for (n = 0; n < conf->params.nelts; ++n, ++param, ++param_elt) {
+            param_elt->type = NGX_RTMP_AMF_STRING;
+            param_elt->name = param->name;
+            param_elt->data = param->value.data;
+            param_elt->len  = param->value.len;
+        }
+    }
 
     return NGX_CONF_OK;
 }
@@ -555,33 +602,6 @@ static ngx_int_t
 ngx_rtmp_relay_send_connect(ngx_rtmp_session_t *s)
 {
     static double               trans = NGX_RTMP_RELAY_CONNECT_TRANS;
-    static double               acodecs = 3575;
-    static double               vcodecs = 252;
-
-    static ngx_rtmp_amf_elt_t   out_cmd[] = {
-
-        { NGX_RTMP_AMF_STRING, 
-          ngx_string("app"),
-          NULL, 0 },    /* <-- fill */
-
-        { NGX_RTMP_AMF_STRING, 
-          ngx_string("tcUrl"),
-          NULL, 0 }, /* <-- fill */
-
-        { NGX_RTMP_AMF_STRING, 
-          ngx_string("flashVer"),
-          "LNX.11,1,102,55", 0 },
-          /*"ngx-remote-relay", 0 },*/ /*TODO*/
-
-        { NGX_RTMP_AMF_NUMBER,
-          ngx_string("audioCodecs"),
-          &acodecs, 0 },
-
-        { NGX_RTMP_AMF_NUMBER,
-          ngx_string("videoCodecs"),
-          &vcodecs, 0 }
-    };
-
     static ngx_rtmp_amf_elt_t   out_elts[] = {
 
         { NGX_RTMP_AMF_STRING,
@@ -594,38 +614,46 @@ ngx_rtmp_relay_send_connect(ngx_rtmp_session_t *s)
 
         { NGX_RTMP_AMF_OBJECT,
           ngx_null_string,
-          out_cmd, sizeof(out_cmd) }
+          NULL, 0 } /* <- param_elts */
     };
 
     ngx_rtmp_core_srv_conf_t   *cscf;
+    ngx_rtmp_relay_app_conf_t  *racf;
     ngx_rtmp_relay_ctx_t       *ctx;
     ngx_rtmp_header_t           h;
+    ngx_rtmp_amf_elt_t         *out_params;
     size_t                      len;
     u_char                     *p;
 
 
     cscf = ngx_rtmp_get_module_srv_conf(s, ngx_rtmp_core_module);
+    racf = ngx_rtmp_get_module_app_conf(s, ngx_rtmp_relay_module);
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_relay_module);
     if (ctx == NULL) {
         return NGX_ERROR;
     }
 
-    out_cmd[0].data = ctx->app.data;
-    out_cmd[0].len  = ctx->app.len;
+    out_elts[2].data = racf->param_elts.elts;
+    out_elts[2].len = racf->param_elts.nelts * sizeof(ngx_rtmp_amf_elt_t);
+    out_params = racf->param_elts.elts;
 
-    /* create good tcUrl; FMS needs it */
+    /* fill app (param #0) */
+    out_params[0].data = ctx->app.data;
+    out_params[0].len  = ctx->app.len;
+
+    /* create good tcUrl; FMS needs it (param #1) */
     len = sizeof("rtmp://") - 1 + ctx->url.len + 
         sizeof("/") - 1 + ctx->app.len;
     p = ngx_palloc(s->connection->pool, len);
     if (p == NULL) {
         return NGX_ERROR;
     }
-    out_cmd[1].data = p;
+    out_params[1].data = p;
     p = ngx_cpymem(p, "rtmp://", sizeof("rtmp://") - 1);
     p = ngx_cpymem(p, ctx->url.data, ctx->url.len);
     *p++ = '/';
     p = ngx_cpymem(p, ctx->app.data, ctx->app.len);
-    out_cmd[1].len = p - (u_char *)out_cmd[1].data;
+    out_params[1].len = p - (u_char *)out_params[1].data;
 
     ngx_memzero(&h, sizeof(h));
     h.csid = NGX_RTMP_RELAY_CSID_AMF_INI;
@@ -1138,6 +1166,24 @@ ngx_rtmp_relay_push_pull(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
         return NGX_CONF_ERROR;
     }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_rtmp_relay_param(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                          *value;
+    ngx_rtmp_relay_app_conf_t          *racf;
+    ngx_rtmp_relay_param_t             *param;
+
+    value = cf->args->elts;
+
+    racf = ngx_rtmp_conf_get_module_app_conf(cf, ngx_rtmp_relay_module);
+    param = ngx_array_push(&racf->params);
+    param->name  = value[1];
+    param->value = value[2];
 
     return NGX_CONF_OK;
 }
